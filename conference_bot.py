@@ -23,7 +23,7 @@ from datetime import date, datetime, timedelta, timezone
 import requests
 from bs4 import BeautifulSoup
 
-VERSION = "v3"
+VERSION = "v4"
 
 # ============================ CẤU HÌNH ============================
 
@@ -53,6 +53,10 @@ TOPIC_SLUGS = [
 # Lưu ý: trang chuyên mục của konferencii.ru xếp TĂNG DẦN từ 2007, nên các
 # hội nghị sắp tới nằm ở những trang CUỐI — bot tự dò trang cuối rồi đi lùi.
 MAX_BACK = int(os.environ.get("MAX_BACK", "10"))
+
+# Số lần "nhảy" tối đa khi dò trang cuối (thanh phân trang chỉ hiện ~50 trang
+# mỗi lần, nên với chuyên mục ~500-700 trang cần khoảng 8-13 lần nhảy)
+JUMP_HOPS = int(os.environ.get("JUMP_HOPS", "15"))
 
 # Độ trễ giữa các request (giây) — để tránh bị chặn
 DELAY = float(os.environ.get("DELAY", "2"))
@@ -275,11 +279,12 @@ def collect_events(today):
         last, _ = fetch_topic_page(slug, 1, seen, today)
         if last is None:
             continue
-        # 2) phân trang chỉ hiện ~100 số một lúc -> nhảy tới "trang cuối"
-        #    vài lần cho tới khi con số không tăng nữa
+        # 2) thanh phân trang chỉ hiện thêm ~50 trang mỗi lần -> bám theo
+        #    con số lớn nhất, nhảy nhiều lần cho tới khi nó không tăng nữa
+        #    (JUMP_HOPS đủ lớn để vượt cả chuyên mục ~700 trang)
         visited = {1}
-        for _ in range(4):
-            if last in visited or last <= 1:
+        for _ in range(JUMP_HOPS):
+            if last <= 1 or last in visited:
                 break
             visited.add(last)
             new_last, _ = fetch_topic_page(slug, last, seen, today)
@@ -288,7 +293,11 @@ def collect_events(today):
             if new_last > last:
                 last = new_last
             else:
-                break
+                break  # trang `last` vừa tải chính là trang cuối thật
+        # nếu hết lượt nhảy mà trang cuối mới phát hiện chưa được tải -> tải nốt
+        if last > 1 and last not in visited:
+            visited.add(last)
+            fetch_topic_page(slug, last, seen, today)
         # 3) đi lùi từ trang cuối về quá khứ
         page = last - 1
         for _ in range(MAX_BACK):
