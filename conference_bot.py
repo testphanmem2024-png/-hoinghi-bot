@@ -125,66 +125,80 @@ def clean(text):
 def parse_listing(html_page):
     """Tách một trang danh sách của konferencii.ru thành list các sự kiện (dict).
 
-    Mỗi sự kiện trên trang được phân tách bởi ảnh huy hiệu 'medal4.png',
-    sau đó là: ngày bắt đầu — ngày kết thúc, hạn nộp ("срок заявок"),
-    tiêu đề (link /info/<id>), chuyên mục (/topic/...), địa điểm (in đậm),
-    hệ thống chỉ mục (/ref-base/...) và ban tổ chức ("Организаторы:").
+    Mốc neo là chính đường link tiêu đề /info/<id> của từng sự kiện
+    (KHÔNG dựa vào ảnh huy hiệu — chỉ một phần sự kiện có huy hiệu).
+    Phần NGAY TRƯỚC link chứa: ngày bắt đầu — ngày kết thúc, hạn nộp
+    ("срок заявок"). Phần SAU link (tới sự kiện kế tiếp) chứa: chuyên mục
+    (/topic/...), địa điểm (in đậm), hệ thống chỉ mục (/ref-base/...) và
+    ban tổ chức ("Организаторы:").
     Nếu sau này trang web đổi giao diện, chỉ cần sửa hàm này.
     """
     events = []
-    blocks = re.split(r"medal4\.png", html_page)[1:]  # bỏ phần đầu trang
-    for block in blocks:
-        # cắt bỏ phần phân trang/chân trang nếu lọt vào khối cuối
-        block = re.split(r"предыдущая|Ctrl", block)[0]
-
-        link_m = INFO_LINK_RE.search(block)
-        if not link_m:
-            continue
-        event_id = link_m.group(1)
-        title = clean(BeautifulSoup(link_m.group(2), "html.parser").get_text(" "))
+    anchors = list(INFO_LINK_RE.finditer(html_page))
+    for idx, m in enumerate(anchors):
+        event_id = m.group(1)
+        title = clean(BeautifulSoup(m.group(2), "html.parser").get_text(" "))
         if not title:
             continue
 
-        text = clean(BeautifulSoup(block, "html.parser").get_text(" "))
-        dates = list(DATE_RE.finditer(text))
+        # --- phần đầu (trước link): ngày tháng + hạn nộp ---
+        head_start = max(0, m.start() - 1500)
+        if idx > 0 and anchors[idx - 1].end() > head_start:
+            head_start = anchors[idx - 1].end()
+        head_text = clean(
+            BeautifulSoup(html_page[head_start:m.start()], "html.parser").get_text(" ")
+        )
+
+        dates = [to_date(d) for d in DATE_RE.finditer(head_text)]
         if not dates:
-            continue
-        start = to_date(dates[0])
-        end = to_date(dates[1]) if len(dates) > 1 else start
+            continue  # link /info/ không kèm ngày => là quảng cáo, bỏ qua
 
         deadline = None
-        dl_m = re.search(r"срок\s+заявок\s*:?\s*(.{0,40})", text, re.IGNORECASE)
-        if dl_m:
-            d2 = DATE_RE.search(dl_m.group(1))
-            if d2:
-                deadline = to_date(d2)
-        deadline_closed = "заявок закончен" in text
+        # bố cục chuẩn: "bắt_đầu — kết_thúc, срок заявок: hạn_nộp" = 3 ngày;
+        # lấy 3 ngày CUỐI để miễn nhiễm với rác (quảng cáo) lọt vào phía trước
+        if "срок заявок" in head_text.lower() and len(dates) >= 3:
+            start, end, deadline = dates[-3], dates[-2], dates[-1]
+        elif len(dates) >= 2:
+            start, end = dates[-2], dates[-1]
+        else:
+            start = end = dates[-1]
+        deadline_closed = "заявок закончен" in head_text
+
+        # --- phần sau (sau link, tới sự kiện kế tiếp): chuyên mục, địa điểm... ---
+        if idx + 1 < len(anchors):
+            tail_end = anchors[idx + 1].start()
+        else:
+            tail_end = min(len(html_page), m.end() + 4000)
+        tail = html_page[m.end():tail_end]
+        # cắt bỏ phân trang/chân trang nếu lọt vào khối cuối
+        tail = re.split(r"предыдущая|Ctrl", tail)[0]
+        tail_text = clean(BeautifulSoup(tail, "html.parser").get_text(" "))
 
         topics = [
             clean(t)
             for t in re.findall(
-                r'href="[^"]*/topic/[\w\-]+/\d+"[^>]*>([^<]+)<', block
+                r'href="[^"]*/topic/[\w\-]+/\d+"[^>]*>([^<]+)<', tail
             )
         ]
         ref_bases = list(dict.fromkeys(
             clean(t)
             for t in re.findall(
-                r'href="[^"]*/ref-base/[\w\-]+/\d+"[^>]*>([^<]+)<', block
+                r'href="[^"]*/ref-base/[\w\-]+/\d+"[^>]*>([^<]+)<', tail
             )
         ))
 
         location = ""
         for tag in ("b", "strong"):
-            bm = re.search(r"<%s>\s*([^<>]{3,80}?)\s*</%s>" % (tag, tag), block)
+            bm = re.search(r"<%s>\s*([^<>]{3,80}?)\s*</%s>" % (tag, tag), tail)
             if bm and "," in bm.group(1):
                 location = clean(bm.group(1))
                 break
         if not location:
-            lm = LOCATION_RE.search(text)
+            lm = LOCATION_RE.search(tail_text)
             location = clean(lm.group(0)) if lm else ""
 
         org = ""
-        om = re.search(r"Организаторы\s*:\s*(.+?)(?:$|\Z)", text)
+        om = re.search(r"Организаторы\s*:\s*(.+?)(?:$|\Z)", tail_text)
         if om:
             org = clean(om.group(1))[:200]
 
