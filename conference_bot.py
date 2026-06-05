@@ -23,6 +23,8 @@ from datetime import date, datetime, timedelta, timezone
 import requests
 from bs4 import BeautifulSoup
 
+VERSION = "v3"
+
 # ============================ CẤU HÌNH ============================
 
 BASE_URL = "https://konferencii.ru"
@@ -47,8 +49,10 @@ TOPIC_SLUGS = [
     if s.strip()
 ]
 
-# Số trang quét cho mỗi chuyên mục (trang đầu chứa các sự kiện gần nhất)
-MAX_PAGES = int(os.environ.get("MAX_PAGES", "5"))
+# Số trang tối đa đi NGƯỢC từ trang cuối về quá khứ (mỗi trang ~20 sự kiện).
+# Lưu ý: trang chuyên mục của konferencii.ru xếp TĂNG DẦN từ 2007, nên các
+# hội nghị sắp tới nằm ở những trang CUỐI — bot tự dò trang cuối rồi đi lùi.
+MAX_BACK = int(os.environ.get("MAX_BACK", "10"))
 
 # Độ trễ giữa các request (giây) — để tránh bị chặn
 DELAY = float(os.environ.get("DELAY", "2"))
@@ -235,22 +239,66 @@ def fetch(url):
     return None
 
 
-def collect_events():
-    """Quét tất cả chuyên mục, gộp và khử trùng lặp theo id sự kiện."""
+def max_page_link(html_page, slug):
+    """Số trang lớn nhất xuất hiện trong các link phân trang /topic/<slug>/N."""
+    nums = re.findall(r"/topic/%s/(\d+)" % re.escape(slug), html_page)
+    return max((int(n) for n in nums), default=1)
+
+
+def fetch_topic_page(slug, page, seen, today=None):
+    """Tải 1 trang, gộp sự kiện vào `seen`, trả về (số_trang_max, ngày_sớm_nhất)."""
+    html_page = fetch(f"{BASE_URL}/topic/{slug}/{page}")
+    time.sleep(DELAY)
+    if not html_page:
+        return None, None
+    page_events = parse_listing(html_page)
+    for ev in page_events:
+        seen.setdefault(ev["id"], ev)
+    earliest = min((ev["start"] for ev in page_events), default=None)
+    print(f"[i] {slug} trang {page}: {len(page_events)} sự kiện"
+          + (f" (sớm nhất {earliest})" if earliest else ""))
+    return max_page_link(html_page, slug), earliest
+
+
+def collect_events(today):
+    """Quét tất cả chuyên mục, gộp và khử trùng lặp theo id sự kiện.
+
+    Trang chuyên mục của konferencii.ru xếp theo thời gian TĂNG DẦN từ 2007
+    (riêng vài sự kiện quảng bá được ghim ở trang 1), nên các hội nghị sắp
+    tới nằm ở các trang CUỐI. Chiến lược: đọc trang 1 (khối quảng bá) ->
+    dò số trang cuối qua link phân trang -> đi NGƯỢC từ trang cuối về cho
+    tới khi gặp các sự kiện đã thuộc quá khứ.
+    """
     seen = {}
     for slug in TOPIC_SLUGS:
-        for page in range(1, MAX_PAGES + 1):
-            url = f"{BASE_URL}/topic/{slug}/{page}"
-            html_page = fetch(url)
-            time.sleep(DELAY)
-            if not html_page:
+        # 1) trang 1: khối quảng bá + manh mối số trang cuối
+        last, _ = fetch_topic_page(slug, 1, seen, today)
+        if last is None:
+            continue
+        # 2) phân trang chỉ hiện ~100 số một lúc -> nhảy tới "trang cuối"
+        #    vài lần cho tới khi con số không tăng nữa
+        visited = {1}
+        for _ in range(4):
+            if last in visited or last <= 1:
                 break
-            page_events = parse_listing(html_page)
-            print(f"[i] {slug} trang {page}: {len(page_events)} sự kiện")
-            if not page_events:
+            visited.add(last)
+            new_last, _ = fetch_topic_page(slug, last, seen, today)
+            if new_last is None:
                 break
-            for ev in page_events:
-                seen.setdefault(ev["id"], ev)
+            if new_last > last:
+                last = new_last
+            else:
+                break
+        # 3) đi lùi từ trang cuối về quá khứ
+        page = last - 1
+        for _ in range(MAX_BACK):
+            if page <= 1 or page in visited:
+                break
+            visited.add(page)
+            _, earliest = fetch_topic_page(slug, page, seen, today)
+            if earliest is not None and earliest < today:
+                break  # trang này đã chạm các sự kiện trong quá khứ -> đủ
+            page -= 1
     return list(seen.values())
 
 
@@ -356,8 +404,9 @@ def main():
         # lấy ngày theo giờ Moscow (UTC+3) để cron trên GitHub chạy ổn định
         today = datetime.now(timezone(timedelta(hours=3))).date()
 
+    print(f"[i] conference_bot {VERSION}")
     print(f"[i] Hôm nay: {today}; mốc thông báo: {sorted(NOTIFY_DAYS)} ngày trước khai mạc")
-    events = collect_events()
+    events = collect_events(today)
     print(f"[i] Tổng cộng thu được {len(events)} sự kiện")
     selected = select_events(events, today)
     print(f"[i] Khớp điều kiện: {len(selected)} sự kiện")
